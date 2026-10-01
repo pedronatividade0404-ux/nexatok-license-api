@@ -1,25 +1,24 @@
+import asyncio
 import base64
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 
-# ============================================================
 # CONFIGURAÇÃO
-# ============================================================
 
 GITHUB_OWNER = os.environ["GITHUB_OWNER"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
-RAW_ROOT = (
+REPO_URL = (
     f"https://api.github.com/repos/"
-    f"{GITHUB_OWNER}/{GITHUB_REPO}/contents"
+    f"{GITHUB_OWNER}/{GITHUB_REPO}"
 )
 
 PLANS = {
@@ -40,16 +39,15 @@ PLANS = {
     },
 }
 
-
 app = FastAPI(
     title="NexaTok License API",
-    version="0.2.0",
+    version="0.3.0",
 )
 
+redeem_lock = asyncio.Lock()
 
-# ============================================================
+
 # MODELOS
-# ============================================================
 
 class LicenseRequest(BaseModel):
     key: str
@@ -58,13 +56,13 @@ class LicenseRequest(BaseModel):
 
 class RedeemRequest(BaseModel):
     currentKey: str
-    newKey: str
+    newKey: str = Field(
+        validation_alias=AliasChoices("newKey", "key")
+    )
     hwid: str
 
 
-# ============================================================
-# GITHUB
-# ============================================================
+# ACESSO AO GITHUB
 
 def headers():
     return {
@@ -74,93 +72,134 @@ def headers():
     }
 
 
-async def get_file(name: str):
-    async with httpx.AsyncClient(timeout=20) as client:
-
-        response = await client.get(
-            f"{RAW_ROOT}/{name}?ref={BRANCH}",
-            headers=headers(),
+async def github(method, path, payload=None, params=None):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.request(
+                method,
+                REPO_URL + path,
+                headers=headers(),
+                json=payload,
+                params=params,
+            )
+    except httpx.HTTPError:
+        raise HTTPException(
+            502,
+            "Não foi possível conectar ao GitHub.",
         )
 
-        if response.status_code != 200:
+    if response.status_code not in (200, 201):
+        if response.status_code in (409, 422):
             raise HTTPException(
-                502,
-                f"GitHub read failed: {response.status_code}",
+                409,
+                "O repositório mudou durante a operação. "
+                "Tente novamente.",
             )
-
-        data = response.json()
-
-        try:
-            content = base64.b64decode(
-                data["content"]
-            ).decode("utf-8")
-        except Exception:
-            raise HTTPException(
-                502,
-                f"Não foi possível ler {name}.",
-            )
-
-        return content, data["sha"]
-
-
-async def put_file(
-    name: str,
-    content: str,
-    sha: str,
-    message: str,
-):
-    payload = {
-        "message": message,
-        "content": base64.b64encode(
-            content.encode("utf-8")
-        ).decode(),
-        "sha": sha,
-        "branch": BRANCH,
-    }
-
-    async with httpx.AsyncClient(timeout=20) as client:
-
-        response = await client.put(
-            f"{RAW_ROOT}/{name}",
-            headers=headers(),
-            json=payload,
+        raise HTTPException(
+            502,
+            f"Falha no GitHub: HTTP {response.status_code}.",
         )
 
-        if response.status_code not in (200, 201):
-            raise HTTPException(
-                502,
-                f"GitHub write failed: {response.status_code}",
-            )
-
+    try:
         return response.json()
+    except ValueError:
+        raise HTTPException(
+            502,
+            "O GitHub retornou uma resposta inválida.",
+        )
 
 
-# ============================================================
-# FUNÇÕES DAS CHAVES
-# ============================================================
+async def get_file(name, ref=None):
+    data = await github(
+        "GET",
+        f"/contents/{name}",
+        params={"ref": ref or BRANCH},
+    )
 
-def parse_line(line: str):
+    try:
+        content = base64.b64decode(
+            data["content"]
+        ).decode("utf-8")
+        return content, data["sha"]
+    except (KeyError, ValueError, UnicodeDecodeError):
+        raise HTTPException(
+            502,
+            f"Não foi possível ler {name}.",
+        )
+
+
+async def put_file(name, content, sha, message):
+    return await github(
+        "PUT",
+        f"/contents/{name}",
+        payload={
+            "message": message,
+            "content": base64.b64encode(
+                content.encode("utf-8")
+            ).decode("ascii"),
+            "sha": sha,
+            "branch": BRANCH,
+        },
+    )
+
+
+async def atomic_files(files, parent):
     """
-    Formato:
-
-    KEY|STATUS|HWID|ACTIVATED_AT|EXPIRES_AT
+    Atualiza a chave antiga e a nova em um único commit.
+    Evita uma renovação parcialmente gravada.
     """
+    commit = await github(
+        "GET",
+        f"/git/commits/{parent}",
+    )
 
-    parts = [
-        part.strip()
-        for part in line.split("|")
-    ]
+    tree = await github(
+        "POST",
+        "/git/trees",
+        payload={
+            "base_tree": commit["tree"]["sha"],
+            "tree": [
+                {
+                    "path": name,
+                    "mode": "100644",
+                    "type": "blob",
+                    "content": content,
+                }
+                for name, content in files.items()
+            ],
+        },
+    )
 
-    if not parts:
+    new_commit = await github(
+        "POST",
+        "/git/commits",
+        payload={
+            "message": "NexaTok: renovar licença",
+            "tree": tree["sha"],
+            "parents": [parent],
+        },
+    )
+
+    await github(
+        "PATCH",
+        f"/git/refs/heads/{quote(BRANCH, safe='/')}",
+        payload={
+            "sha": new_commit["sha"],
+            "force": False,
+        },
+    )
+
+
+# FUNÇÕES AUXILIARES
+
+def parse_line(line):
+    # KEY|STATUS|HWID|ACTIVATED_AT|EXPIRES_AT
+    parts = [value.strip() for value in line.split("|")]
+
+    if not parts[0] or parts[0].startswith("#"):
         return None
 
-    if not parts[0]:
-        return None
-
-    if parts[0].startswith("#"):
-        return None
-
-    parts += [""] * (5 - len(parts))
+    parts += [""] * max(0, 5 - len(parts))
 
     return {
         "key": parts[0],
@@ -181,87 +220,67 @@ def render(item):
     ])
 
 
-def find_key(content: str, key: str):
-    lines = content.splitlines()
-
-    for index, line in enumerate(lines):
-
+def find_key(content, key):
+    for index, line in enumerate(content.splitlines()):
         item = parse_line(line)
-
-        if (
-            item
-            and item["key"].lower()
-            == key.lower()
-        ):
+        if item and item["key"].lower() == key.lower():
             return index, item
 
     return None, None
 
 
-# ============================================================
-# PREÇOS
-# ============================================================
-
-async def load_price(plan: str):
+def parse_date(value):
     try:
-
-        content, _ = await get_file(
-            "prices.txt"
+        result = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+        if result.tzinfo is None:
+            raise ValueError()
+        return result.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            409,
+            "Registro de licença com data inválida.",
         )
 
+
+def utc_string(value):
+    return value.astimezone(timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+async def load_price(plan):
+    try:
+        content, _ = await get_file("prices.txt")
+
         for line in content.splitlines():
-
-            if "=" not in line:
+            if line.lstrip().startswith("#") or "=" not in line:
                 continue
 
-            if line.lstrip().startswith("#"):
-                continue
+            name, value = line.split("=", 1)
+            if name.strip().lower() == plan:
+                return float(value.strip().replace(",", "."))
 
-            key, value = line.split("=", 1)
-
-            if key.strip().lower() == plan.lower():
-
-                return float(
-                    value
-                    .strip()
-                    .replace(",", ".")
-                )
-
-    except Exception:
+    except (HTTPException, ValueError):
         pass
 
     return 0.0
 
 
-# ============================================================
-# CRIAR OBJETO DE LICENÇA
-# ============================================================
-
-def make_license(
-    key,
-    plan,
-    hwid,
-    activated,
-    expires,
-    price,
-):
+async def make_license(plan, item):
     return {
-        "key": key,
+        "key": item["key"],
         "plan": plan,
         "maxAccounts": PLANS[plan]["maxAccounts"],
-        "activatedAt": activated,
-        "expiresAt": expires,
-        "hwid": hwid,
-        "price": price,
+        "activatedAt": item["activated"],
+        "expiresAt": item["expires"],
+        "hwid": item["hwid"],
+        "price": await load_price(plan),
     }
 
 
-# ============================================================
-# ATIVAÇÃO
-# ============================================================
-
-async def process(req: LicenseRequest):
-
+def request_values(req):
     key = req.key.strip()
     hwid = req.hwid.strip()
 
@@ -271,227 +290,107 @@ async def process(req: LicenseRequest):
             "Chave ou HWID inválido.",
         )
 
+    return key, hwid
+
+
+def check_used(item, hwid):
+    if item["status"].upper() != "USED":
+        raise HTTPException(
+            403,
+            "Licença não ativada ou já substituída.",
+        )
+
+    if item["hwid"] != hwid:
+        raise HTTPException(
+            403,
+            "Licença não vinculada a este computador.",
+        )
+
+    parse_date(item["activated"])
+    expires = parse_date(item["expires"])
+
+    if expires <= datetime.now(timezone.utc):
+        raise HTTPException(
+            410,
+            "Esta licença expirou.",
+        )
+
+
+# ATIVAÇÃO
+
+@app.post("/v1/activate")
+async def activate(req: LicenseRequest):
+    key, hwid = request_values(req)
+
     for plan, cfg in PLANS.items():
-
-        content, sha = await get_file(
-            cfg["file"]
-        )
-
-        idx, item = find_key(
-            content,
-            key,
-        )
+        content, sha = await get_file(cfg["file"])
+        index, item = find_key(content, key)
 
         if item is None:
             continue
 
-        now = datetime.now(
-            timezone.utc
-        )
+        status = item["status"].upper()
 
-        # ----------------------------------------------------
-        # CHAVE JÁ UTILIZADA
-        # ----------------------------------------------------
+        if status == "USED":
+            check_used(item, hwid)
+            return {
+                "ok": True,
+                "license": await make_license(plan, item),
+            }
 
-        if item["status"].upper() == "USED":
-
-            if item["hwid"] != hwid:
-                raise HTTPException(
-                    409,
-                    "Esta chave já está vinculada "
-                    "a outro computador.",
-                )
-
-            try:
-
-                expires = datetime.fromisoformat(
-                    item["expires"].replace(
-                        "Z",
-                        "+00:00",
-                    )
-                )
-
-                datetime.fromisoformat(
-                    item["activated"].replace(
-                        "Z",
-                        "+00:00",
-                    )
-                )
-
-            except Exception:
-
-                raise HTTPException(
-                    409,
-                    "Registro de licença inválido.",
-                )
-
-            if expires <= now:
-                raise HTTPException(
-                    410,
-                    "Esta licença expirou.",
-                )
-
-            return make_license(
-                key,
-                plan,
-                hwid,
-                item["activated"],
-                item["expires"],
-                await load_price(plan),
+        if status != "AVAILABLE":
+            raise HTTPException(
+                409,
+                "Esta chave não está disponível para ativação.",
             )
 
-        # ----------------------------------------------------
-        # PRIMEIRA ATIVAÇÃO
-        # ----------------------------------------------------
-
-        activated = now
-
-        expires = (
-            now
-            + timedelta(
-                days=cfg["days"]
-            )
-        )
+        now = datetime.now(timezone.utc)
 
         item.update({
             "status": "USED",
             "hwid": hwid,
-            "activated": (
-                activated
-                .isoformat()
-                .replace(
-                    "+00:00",
-                    "Z",
-                )
-            ),
-            "expires": (
-                expires
-                .isoformat()
-                .replace(
-                    "+00:00",
-                    "Z",
-                )
+            "activated": utc_string(now),
+            "expires": utc_string(
+                now + timedelta(days=cfg["days"])
             ),
         })
 
         lines = content.splitlines()
-
-        lines[idx] = render(item)
+        lines[index] = render(item)
 
         await put_file(
             cfg["file"],
             "\n".join(lines) + "\n",
             sha,
-            f"NexaTok: activate {plan} key",
+            f"NexaTok: ativar licença {plan}",
         )
 
-        return make_license(
-            key,
-            plan,
-            hwid,
-            item["activated"],
-            item["expires"],
-            await load_price(plan),
-        )
+        return {
+            "ok": True,
+            "license": await make_license(plan, item),
+        }
 
-    raise HTTPException(
-        404,
-        "Chave inválida.",
-    )
+    raise HTTPException(404, "Chave inválida.")
 
 
-# ============================================================
-# POST /v1/activate
-# ============================================================
-
-@app.post("/v1/activate")
-async def activate(req: LicenseRequest):
-
-    license_data = await process(req)
-
-    return {
-        "ok": True,
-        "license": license_data,
-    }
-
-
-# ============================================================
-# POST /v1/validate
-# ============================================================
+# VALIDAÇÃO
 
 @app.post("/v1/validate")
 async def validate(req: LicenseRequest):
-
-    key = req.key.strip()
-    hwid = req.hwid.strip()
-
-    if not key or not hwid:
-        raise HTTPException(
-            400,
-            "Chave ou HWID inválido.",
-        )
+    key, hwid = request_values(req)
 
     for plan, cfg in PLANS.items():
-
-        content, _ = await get_file(
-            cfg["file"]
-        )
-
-        _, item = find_key(
-            content,
-            key,
-        )
+        content, _ = await get_file(cfg["file"])
+        _, item = find_key(content, key)
 
         if item is None:
             continue
 
-        if item["status"].upper() != "USED":
-            raise HTTPException(
-                403,
-                "Licença ainda não foi ativada.",
-            )
-
-        if item["hwid"] != hwid:
-            raise HTTPException(
-                403,
-                "Licença não vinculada "
-                "a este computador.",
-            )
-
-        try:
-
-            expires = datetime.fromisoformat(
-                item["expires"].replace(
-                    "Z",
-                    "+00:00",
-                )
-            )
-
-        except Exception:
-
-            raise HTTPException(
-                500,
-                "Data de expiração inválida.",
-            )
-
-        if expires <= datetime.now(
-            timezone.utc
-        ):
-            raise HTTPException(
-                410,
-                "Licença expirada.",
-            )
+        check_used(item, hwid)
 
         return {
             "ok": True,
-            "license": make_license(
-                key,
-                plan,
-                hwid,
-                item["activated"],
-                item["expires"],
-                await load_price(plan),
-            ),
+            "license": await make_license(plan, item),
         }
 
     raise HTTPException(
@@ -500,281 +399,145 @@ async def validate(req: LicenseRequest):
     )
 
 
-# ============================================================
-# POST /v1/redeem
-# ============================================================
+# RESGATE / RENOVAÇÃO
 
 @app.post("/v1/redeem")
 async def redeem(req: RedeemRequest):
-
     current_key = req.currentKey.strip()
     new_key = req.newKey.strip()
     hwid = req.hwid.strip()
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO INICIAL
-    # --------------------------------------------------------
-
-    if not current_key:
+    if not current_key or len(new_key) < 8 or not hwid:
         raise HTTPException(
             400,
-            "Chave atual não informada.",
-        )
-
-    if not new_key:
-        raise HTTPException(
-            400,
-            "Nova chave não informada.",
-        )
-
-    if not hwid:
-        raise HTTPException(
-            400,
-            "HWID não informado.",
+            "Dados de renovação inválidos.",
         )
 
     if current_key.lower() == new_key.lower():
         raise HTTPException(
             400,
-            "A nova chave deve ser diferente "
-            "da chave atual.",
+            "A nova chave deve ser diferente da chave atual.",
         )
 
-    # --------------------------------------------------------
-    # 1. PROCURAR LICENÇA ATUAL
-    # --------------------------------------------------------
-
-    current_plan = None
-    current_item = None
-
-    for plan, cfg in PLANS.items():
-
-        content, _ = await get_file(
-            cfg["file"]
+    async with redeem_lock:
+        ref = await github(
+            "GET",
+            f"/git/ref/heads/{quote(BRANCH, safe='/')}",
         )
+        parent = ref["object"]["sha"]
 
-        _, item = find_key(
-            content,
-            current_key,
-        )
+        snapshots = {}
+        current_found = None
+        new_found = None
 
-        if item is not None:
-
-            current_plan = plan
-            current_item = item
-
-            break
-
-    if current_item is None:
-        raise HTTPException(
-            404,
-            "Licença atual não encontrada.",
-        )
-
-    # --------------------------------------------------------
-    # 2. VERIFICAR LICENÇA ATUAL
-    # --------------------------------------------------------
-
-    if (
-        current_item["status"].upper()
-        != "USED"
-    ):
-        raise HTTPException(
-            409,
-            "A licença atual ainda "
-            "não foi ativada.",
-        )
-
-    if current_item["hwid"] != hwid:
-        raise HTTPException(
-            403,
-            "A licença atual pertence "
-            "a outro computador.",
-        )
-
-    try:
-
-        current_expires = (
-            datetime.fromisoformat(
-                current_item[
-                    "expires"
-                ].replace(
-                    "Z",
-                    "+00:00",
-                )
+        # Todos os arquivos são lidos do mesmo commit.
+        for plan, cfg in PLANS.items():
+            content, _ = await get_file(
+                cfg["file"],
+                ref=parent,
             )
-        )
+            snapshots[cfg["file"]] = content.splitlines()
 
-    except Exception:
+            old_index, old_item = find_key(content, current_key)
+            new_index, new_item = find_key(content, new_key)
 
-        raise HTTPException(
-            500,
-            "Data de expiração da "
-            "licença atual inválida.",
-        )
+            if old_item is not None:
+                current_found = (
+                    plan, cfg, old_index, old_item
+                )
 
-    # --------------------------------------------------------
-    # 3. PROCURAR NOVA CHAVE
-    # --------------------------------------------------------
+            if new_item is not None:
+                new_found = (
+                    plan, cfg, new_index, new_item
+                )
 
-    new_plan = None
-    new_cfg = None
-    new_content = None
-    new_sha = None
-    new_idx = None
-    new_item = None
+        if current_found is None:
+            raise HTTPException(
+                404,
+                "Licença atual não encontrada.",
+            )
 
-    for plan, cfg in PLANS.items():
+        old_plan, old_cfg, old_index, old_item = current_found
 
-        content, sha = await get_file(
-            cfg["file"]
-        )
+        if old_item["status"].upper() != "USED":
+            raise HTTPException(
+                409,
+                "A licença atual não está ativada "
+                "ou já foi substituída.",
+            )
 
-        idx, item = find_key(
-            content,
-            new_key,
-        )
+        if old_item["hwid"] != hwid:
+            raise HTTPException(
+                403,
+                "A licença atual pertence a outro computador.",
+            )
 
-        if item is not None:
+        if new_found is None:
+            raise HTTPException(
+                404,
+                "Nova chave inválida.",
+            )
 
-            new_plan = plan
-            new_cfg = cfg
-            new_content = content
-            new_sha = sha
-            new_idx = idx
-            new_item = item
+        new_plan, new_cfg, new_index, new_item = new_found
 
-            break
+        if new_item["status"].upper() != "AVAILABLE":
+            raise HTTPException(
+                409,
+                "Esta nova chave já foi utilizada "
+                "ou não está disponível.",
+            )
 
-    if new_item is None:
-        raise HTTPException(
-            404,
-            "Nova chave inválida.",
-        )
+        now = datetime.now(timezone.utc)
+        previous_expires = parse_date(old_item["expires"])
 
-    # --------------------------------------------------------
-    # 4. VERIFICAR SE NOVA CHAVE JÁ FOI USADA
-    # --------------------------------------------------------
+        # Preserva o tempo restante; se expirou, começa agora.
+        base_date = max(previous_expires, now)
+        expires = base_date + timedelta(days=new_cfg["days"])
 
-    if (
-        new_item["status"].upper()
-        == "USED"
-    ):
-        raise HTTPException(
-            409,
-            "Esta nova chave já foi utilizada.",
-        )
+        new_item.update({
+            "status": "USED",
+            "hwid": hwid,
+            "activated": utc_string(now),
+            "expires": utc_string(expires),
+        })
 
-    # --------------------------------------------------------
-    # 5. CALCULAR NOVA DATA
-    # --------------------------------------------------------
+        # O tempo da chave antiga foi transferido para a nova.
+        old_item["status"] = "REDEEMED"
 
-    now = datetime.now(
-        timezone.utc
-    )
+        snapshots[old_cfg["file"]][old_index] = render(old_item)
+        snapshots[new_cfg["file"]][new_index] = render(new_item)
 
-    # Se ainda existe tempo restante,
-    # preservamos esse tempo.
-    #
-    # Se já expirou, começa de agora.
+        changed_files = {
+            name: "\n".join(snapshots[name]) + "\n"
+            for name in {
+                old_cfg["file"],
+                new_cfg["file"],
+            }
+        }
 
-    if current_expires > now:
-        base_date = current_expires
-    else:
-        base_date = now
+        await atomic_files(changed_files, parent)
 
-    added_days = new_cfg["days"]
-
-    new_expires = (
-        base_date
-        + timedelta(
-            days=added_days
-        )
-    )
-
-    activated_string = (
-        now
-        .isoformat()
-        .replace(
-            "+00:00",
-            "Z",
-        )
-    )
-
-    expires_string = (
-        new_expires
-        .isoformat()
-        .replace(
-            "+00:00",
-            "Z",
-        )
-    )
-
-    # --------------------------------------------------------
-    # 6. MARCAR NOVA CHAVE COMO USED
-    # --------------------------------------------------------
-
-    new_item.update({
-        "status": "USED",
-        "hwid": hwid,
-        "activated": activated_string,
-        "expires": expires_string,
-    })
-
-    lines = new_content.splitlines()
-
-    lines[new_idx] = render(
-        new_item
-    )
-
-    await put_file(
-        new_cfg["file"],
-        "\n".join(lines) + "\n",
-        new_sha,
-        f"NexaTok: redeem {new_plan} key",
-    )
-
-    # --------------------------------------------------------
-    # 7. RETORNAR NOVA LICENÇA
-    # --------------------------------------------------------
-
-    return {
-        "ok": True,
-
-        "license": make_license(
-            new_key,
-            new_plan,
-            hwid,
-            activated_string,
-            expires_string,
-            await load_price(
-                new_plan
-            ),
-        ),
-
-        "renewal": {
-            "previousKey": current_key,
-            "previousPlan": current_plan,
-            "newKey": new_key,
-            "newPlan": new_plan,
-            "addedDays": added_days,
-            "previousExpiresAt": (
-                current_item["expires"]
-            ),
-            "expiresAt": expires_string,
-        },
-    }
+        return {
+            "ok": True,
+            "license": await make_license(new_plan, new_item),
+            "renewal": {
+                "previousKey": old_item["key"],
+                "previousPlan": old_plan,
+                "newKey": new_item["key"],
+                "newPlan": new_plan,
+                "addedDays": new_cfg["days"],
+                "previousExpiresAt": utc_string(previous_expires),
+                "expiresAt": new_item["expires"],
+            },
+        }
 
 
-# ============================================================
-# GET /health
-# ============================================================
+# HEALTH CHECK
 
 @app.get("/health")
 async def health():
-
     return {
         "ok": True,
         "service": "NexaTok License API",
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
